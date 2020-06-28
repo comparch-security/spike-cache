@@ -247,6 +247,7 @@ struct state_t
 
   uint32_t fflags;
   uint32_t frm;
+  uint64_t cache_timer;
   bool serialized; // whether timer CSRs are in a well-defined state
 
   // When true, execute a single instruction and then enter debug mode.  This

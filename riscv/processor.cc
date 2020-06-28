@@ -16,6 +16,9 @@
 #include <stdexcept>
 #include <string>
 #include <algorithm>
+// instantiate the global object reporter
+#include "util/report.hpp"
+Reporter_t reporter;
 
 #undef STATE
 #define STATE state
@@ -29,7 +32,7 @@ processor_t::processor_t(const char* isa, const char* varch, simif_t* sim,
   parse_isa_string(isa);
   parse_varch_string(varch);
   register_base_instructions();
-  mmu = new mmu_t(sim, this);
+  mmu = new mmu_t(sim, this, &(state.cache_timer));
 
   disassembler = new disassembler_t(max_xlen);
   if (ext)

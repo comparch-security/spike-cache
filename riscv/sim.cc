@@ -41,11 +41,12 @@ sim_t::sim_t(const char* isa, const char* varch, size_t nprocs, bool halted,
 
   debug_module.add_device(&bus);
 
-  debug_mmu = new mmu_t(this, NULL);
+  debug_mmu = new mmu_t(this, NULL, NULL);
 
   if (hartids.size() == 0) {
     for (size_t i = 0; i < procs.size(); i++) {
       procs[i] = new processor_t(isa, varch, this, i, halted);
+      procs[i]->get_mmu()->register_mems(mems);
     }
   }
   else {

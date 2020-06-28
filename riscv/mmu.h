@@ -10,6 +10,8 @@
 #include "simif.h"
 #include "processor.h"
 #include "memtracer.h"
+#include "cache/cache.hpp"
+#include "tlb.h"
 #include <stdlib.h>
 #include <vector>
 
@@ -53,8 +55,9 @@ class trigger_matched_t
 class mmu_t
 {
 public:
-  mmu_t(simif_t* sim, processor_t* proc);
+  mmu_t(simif_t* sim, processor_t* proc, uint64_t *latency);
   ~mmu_t();
+  WalkRecord tlb_walk_record;  // record the last page walk for the hardware TLB optimization
 
   inline reg_t misaligned_load(reg_t addr, size_t size)
   {
@@ -84,19 +87,25 @@ public:
       if (unlikely(addr & (sizeof(type##_t)-1))) \
         return misaligned_load(addr, sizeof(type##_t)); \
       reg_t vpn = addr >> PGSHIFT; \
+      type##_t res; \
       if (likely(tlb_load_tag[vpn % TLB_ENTRIES] == vpn)) \
-        return *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
-      if (unlikely(tlb_load_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
-        type##_t data = *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
+        res = *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
+      else if (unlikely(tlb_load_tag[vpn % TLB_ENTRIES] == (vpn | TLB_CHECK_TRIGGERS))) { \
+        res = *(type##_t*)(tlb_data[vpn % TLB_ENTRIES].host_offset + addr); \
         if (!matched_trigger) { \
-          matched_trigger = trigger_exception(OPERATION_LOAD, addr, data); \
+          matched_trigger = trigger_exception(OPERATION_LOAD, addr, res); \
           if (matched_trigger) \
             throw *matched_trigger; \
         } \
-        return data; \
+      } else \
+        load_slow_path(addr, sizeof(type##_t), (uint8_t*)&res); \
+      if(tlb_d) { \
+        auto tr = tlb_d->translate(latency, vpn, LOAD, get_translate_mode(LOAD)); \
+        uint64_t paddr = addr + tlb_data[vpn % TLB_ENTRIES].target_offset; \
+        if(tr.va) assert(tr.ppn == paddr >> PGSHIFT); \
+        if(tr.va) assert(check_tlb_permission_data(tr.pte, LOAD)); \
+        if(cache_d && is_memory(paddr)) cache_d->read(latency, paddr, 0); \
       } \
-      type##_t res; \
-      load_slow_path(addr, sizeof(type##_t), (uint8_t*)&res); \
       return res; \
     }
 
@@ -130,6 +139,13 @@ public:
       } \
       else \
         store_slow_path(addr, sizeof(type##_t), (const uint8_t*)&val); \
+      if(tlb_d) { \
+        auto tr = tlb_d->translate(latency, vpn, STORE, get_translate_mode(STORE)); \
+        uint64_t paddr = addr + tlb_data[vpn % TLB_ENTRIES].target_offset; \
+        if(tr.va) assert(tr.ppn == paddr >> PGSHIFT); \
+        if(tr.va) assert(check_tlb_permission_data(tr.pte, STORE)); \
+        if(cache_d && is_memory(paddr)) cache_d->write(latency, paddr, 0, true); \
+      } \
     }
 
   // template for functions that perform an atomic memory operation
@@ -216,6 +232,9 @@ public:
     insn_bits_t insn = *(uint16_t*)(tlb_entry.host_offset + addr);
     int length = insn_length(insn);
 
+    uint64_t paddr = addr + tlb_entry.target_offset;
+    if(cache_i && is_memory(paddr)) cache_i->read(latency, paddr, 0); // normally more than one instruction is readed per refill
+
     if (likely(length == 4)) {
       insn |= (insn_bits_t)*(const int16_t*)translate_insn_addr_to_host(addr + 2) << 16;
     } else if (length == 2) {
@@ -235,19 +254,19 @@ public:
     entry->next = &icache[icache_index(addr + length)];
     entry->data = fetch;
 
-    reg_t paddr = tlb_entry.target_offset + addr;;
-    if (tracer.interested_in_range(paddr, paddr + 1, FETCH)) {
-      entry->tag = -1;
-      tracer.trace(paddr, length, FETCH);
-    }
     return entry;
   }
 
   inline icache_entry_t* access_icache(reg_t addr)
   {
     icache_entry_t* entry = &icache[icache_index(addr)];
-    if (likely(entry->tag == addr))
+    if (likely(entry->tag == addr)) {
+      auto tlb_entry = translate_insn_addr(addr); // must have hit in software tlb
+      uint64_t paddr = addr + tlb_entry.target_offset;
+      if(cache_i && is_memory(paddr))
+        cache_i->read(latency, paddr, 0);
       return entry;
+    }
     return refill_icache(addr, entry);
   }
 
@@ -259,6 +278,8 @@ public:
 
   void flush_tlb();
   void flush_icache();
+  void flush_hard_tlb_i() { if(tlb_i) tlb_i->flush(); }
+  void flush_hard_tlb_d() { if(tlb_d) tlb_d->flush(); }
 
   void register_memtracer(memtracer_t*);
 
@@ -278,6 +299,24 @@ public:
 #else
     return 0;
 #endif
+  }
+
+  memtracer_list_t* get_tracer() { return &tracer; }
+
+  // perform a page table walk for a given VA; set referenced/dirty bits
+  reg_t walk(reg_t addr, access_type type, reg_t prv);
+
+  void register_cache_models(CoherentCache *ic, CoherentCache *dc) {
+    cache_i = ic;
+    cache_d = dc;
+    tlb_i = new HardTLBBase(this, dc, 8);
+    tlb_d = new HardTLBBase(this, dc, 8);
+  }
+
+  void register_mems(const std::vector<std::pair<reg_t, mem_t*>> &mems) {
+    for(auto m:mems) {
+      mem_regions.push_back(std::make_pair(m.first, m.second->size()));
+    }
   }
 
 private:
@@ -300,26 +339,62 @@ private:
   reg_t tlb_load_tag[TLB_ENTRIES];
   reg_t tlb_store_tag[TLB_ENTRIES];
 
+  // the cache simulator
+  std::list<std::pair<uint64_t, uint64_t>> mem_regions;
+  CoherentCache *cache_i;  // instruction cache
+  HardTLBBase *tlb_i;      // instruction TLB
+  CoherentCache *cache_d;  // data cache
+  HardTLBBase *tlb_d;      // data TLB
+  uint64_t *latency;       // the latency estimation
+
   // finish translation on a TLB miss and update the TLB
   tlb_entry_t refill_tlb(reg_t vaddr, reg_t paddr, char* host_addr, access_type type);
   const char* fill_from_mmio(reg_t vaddr, reg_t paddr);
 
-  // perform a page table walk for a given VA; set referenced/dirty bits
-  reg_t walk(reg_t addr, access_type type, reg_t prv);
+
 
   // handle uncommon cases: TLB misses, page faults, MMIO
   tlb_entry_t fetch_slow_path(reg_t addr);
   void load_slow_path(reg_t addr, reg_t len, uint8_t* bytes);
   void store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes);
   reg_t translate(reg_t addr, reg_t len, access_type type);
+  reg_t get_translate_mode(access_type type);
+
+  bool is_memory(uint64_t paddr) const {
+    for(auto m:mem_regions)
+      if(paddr >= m.first && paddr < m.first+m.second)
+        return true;
+    return false;
+  }
+
+  bool check_tlb_permission_insn(reg_t pte) {
+    reg_t mode = proc->state.prv;
+    assert(get_field(pte, PTE_V) && get_field(pte, PTE_X));
+    assert(!(mode == PRV_U) || get_field(pte, PTE_U));
+    return true;
+  }
+
+  bool check_tlb_permission_data(reg_t pte, access_type acc_type) {
+    reg_t mstatus = proc->state.mstatus;
+    reg_t mode = proc->state.prv;
+    if (!proc->state.debug_mode && get_field(mstatus, MSTATUS_MPRV))
+      mode = get_field(mstatus, MSTATUS_MPP);
+    assert(get_field(pte, PTE_V));
+    assert(!(acc_type == LOAD) ||
+           (get_field(pte, PTE_R) || (get_field(pte, PTE_X) && get_field(mstatus, MSTATUS_MXR))));
+    assert(!(acc_type == STORE) || (get_field(pte, PTE_W) && get_field(pte, PTE_R)));
+    assert(!(mode == PRV_U) || get_field(pte, PTE_U));
+    assert(!(mode == PRV_S) || !get_field(pte, PTE_U) || get_field(proc->state.mstatus, MSTATUS_SUM));
+    return true;
+  }
 
   // ITLB lookup
   inline tlb_entry_t translate_insn_addr(reg_t addr) {
     reg_t vpn = addr >> PGSHIFT;
-    if (likely(tlb_insn_tag[vpn % TLB_ENTRIES] == vpn))
-      return tlb_data[vpn % TLB_ENTRIES];
     tlb_entry_t result;
-    if (unlikely(tlb_insn_tag[vpn % TLB_ENTRIES] != (vpn | TLB_CHECK_TRIGGERS))) {
+    if (likely(tlb_insn_tag[vpn % TLB_ENTRIES] == vpn)) {
+      result = tlb_data[vpn % TLB_ENTRIES];
+    } else if (unlikely(tlb_insn_tag[vpn % TLB_ENTRIES] != (vpn | TLB_CHECK_TRIGGERS))) {
       result = fetch_slow_path(addr);
     } else {
       result = tlb_data[vpn % TLB_ENTRIES];
@@ -331,6 +406,14 @@ private:
         throw trigger_matched_t(match, OPERATION_EXECUTE, addr, *ptr);
       }
     }
+
+    // simulate the hardware TLB
+    if(tlb_i) {
+      auto tr = tlb_i->translate(latency, vpn, FETCH, get_translate_mode(FETCH));
+      if(tr.va) assert(tr.ppn == (addr + result.target_offset) >> PGSHIFT);
+      if(tr.va) assert(check_tlb_permission_insn(tr.pte));
+    }
+
     return result;
   }
 

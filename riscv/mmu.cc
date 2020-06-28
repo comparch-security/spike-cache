@@ -4,8 +4,11 @@
 #include "simif.h"
 #include "processor.h"
 
-mmu_t::mmu_t(simif_t* sim, processor_t* proc)
+mmu_t::mmu_t(simif_t* sim, processor_t* proc, uint64_t *latency)
  : sim(sim), proc(proc),
+  cache_i(NULL), tlb_i(NULL),
+  cache_d(NULL), tlb_d(NULL),
+  latency(latency),
   check_triggers_fetch(false),
   check_triggers_load(false),
   check_triggers_store(false),
@@ -17,6 +20,8 @@ mmu_t::mmu_t(simif_t* sim, processor_t* proc)
 
 mmu_t::~mmu_t()
 {
+  if(tlb_i) delete tlb_i;
+  if(tlb_d) delete tlb_d;
 }
 
 void mmu_t::flush_icache()
@@ -44,16 +49,22 @@ static void throw_access_exception(reg_t addr, access_type type)
   }
 }
 
-reg_t mmu_t::translate(reg_t addr, reg_t len, access_type type)
+reg_t mmu_t::get_translate_mode(access_type type)
 {
-  if (!proc)
-    return addr;
-
   reg_t mode = proc->state.prv;
   if (type != FETCH) {
     if (!proc->state.debug_mode && get_field(proc->state.mstatus, MSTATUS_MPRV))
       mode = get_field(proc->state.mstatus, MSTATUS_MPP);
   }
+  return mode;
+}
+
+reg_t mmu_t::translate(reg_t addr, reg_t len, access_type type)
+{
+  if (!proc)
+    return addr;
+
+  reg_t mode = get_translate_mode(type);
 
   reg_t paddr = walk(addr, type, mode) | (addr & (PGSIZE-1));
   if (!pmp_ok(paddr, len, type, mode))
@@ -107,9 +118,6 @@ void mmu_t::load_slow_path(reg_t addr, reg_t len, uint8_t* bytes)
 
   if (auto host_addr = sim->addr_to_mem(paddr)) {
     memcpy(bytes, host_addr, len);
-    if (tracer.interested_in_range(paddr, paddr + PGSIZE, LOAD))
-      tracer.trace(paddr, len, LOAD);
-    else
       refill_tlb(addr, paddr, host_addr, LOAD);
   } else if (!sim->mmio_load(paddr, len, bytes)) {
     throw trap_load_access_fault(addr);
@@ -136,9 +144,6 @@ void mmu_t::store_slow_path(reg_t addr, reg_t len, const uint8_t* bytes)
 
   if (auto host_addr = sim->addr_to_mem(paddr)) {
     memcpy(host_addr, bytes, len);
-    if (tracer.interested_in_range(paddr, paddr + PGSIZE, STORE))
-      tracer.trace(paddr, len, STORE);
-    else
       refill_tlb(addr, paddr, host_addr, STORE);
   } else if (!sim->mmio_store(paddr, len, bytes)) {
     throw trap_store_access_fault(addr);
@@ -263,8 +268,12 @@ reg_t mmu_t::pmp_homogeneous(reg_t addr, reg_t len)
 reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
 {
   vm_info vm = decode_vm_info(proc->max_xlen, mode, proc->get_state()->satp);
-  if (vm.levels == 0)
+  // record
+  tlb_walk_record.levels = vm.levels;
+  tlb_walk_record.vpn    = addr >> PGSHIFT;
+  if (vm.levels == 0) {
     return addr & ((reg_t(2) << (proc->xlen-1))-1); // zero-extend from xlen
+  }
 
   bool s_mode = mode == PRV_S;
   bool sum = get_field(proc->state.mstatus, MSTATUS_SUM);
@@ -274,8 +283,10 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
   int va_bits = PGSHIFT + vm.levels * vm.idxbits;
   reg_t mask = (reg_t(1) << (proc->xlen - (va_bits-1))) - 1;
   reg_t masked_msbs = (addr >> (va_bits-1)) & mask;
-  if (masked_msbs != 0 && masked_msbs != mask)
+  if (masked_msbs != 0 && masked_msbs != mask) {
     vm.levels = 0;
+    tlb_walk_record.levels = 0;
+  }
 
   reg_t base = vm.ptbase;
   for (int i = vm.levels - 1; i >= 0; i--) {
@@ -284,6 +295,7 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
 
     // check that physical address of PTE is legal
     auto pte_paddr = base + idx * vm.ptesize;
+    tlb_walk_record.ptes[vm.levels-1-i] = pte_paddr;
     auto ppte = sim->addr_to_mem(pte_paddr);
     if (!ppte || !pmp_ok(pte_paddr, vm.ptesize, LOAD, PRV_S))
       throw_access_exception(addr, type);
@@ -319,8 +331,11 @@ reg_t mmu_t::walk(reg_t addr, access_type type, reg_t mode)
 #endif
       // for superpage mappings, make a fake leaf PTE for the TLB's benefit.
       reg_t vpn = addr >> PGSHIFT;
-      reg_t value = (ppn | (vpn & ((reg_t(1) << ptshift) - 1))) << PGSHIFT;
-      return value;
+      reg_t value = (ppn | (vpn & ((reg_t(1) << ptshift) - 1)));
+      tlb_walk_record.ppn = value;
+      tlb_walk_record.levels = vm.levels - i;
+      tlb_walk_record.pte = pte;
+      return value << PGSHIFT;
     }
   }
 

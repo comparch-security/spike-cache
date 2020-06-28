@@ -12,7 +12,11 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include "cache/cache.hpp"
+#include "util/cache_config_parser.hpp"
+#include "util/report.hpp"
 #include "../VERSION"
+extern Reporter_t reporter;
 
 static void help(int exit_code = 1)
 {
@@ -32,13 +36,12 @@ static void help(int exit_code = 1)
   fprintf(stderr, "  --varch=<name>        RISC-V Vector uArch string [default %s]\n", DEFAULT_VARCH);
   fprintf(stderr, "  --pc=<address>        Override ELF entry point\n");
   fprintf(stderr, "  --hartids=<a,b,...>   Explicitly specify hartids, default is 0,1,...\n");
-  fprintf(stderr, "  --ic=<S>:<W>:<B>      Instantiate a cache model with S sets,\n");
-  fprintf(stderr, "  --dc=<S>:<W>:<B>        W ways, and B-byte blocks (with S and\n");
-  fprintf(stderr, "  --l2=<S>:<W>:<B>        B both powers of 2).\n");
-  fprintf(stderr, "  --log-cache-miss      Generate a log of cache miss\n");
+  fprintf(stderr, "  --cache-cfile=<name>  the configuration file for the cache model [default cache_model/config/cache.json]\n");
+  fprintf(stderr, "  --cache-model=<name>  name of the cache mod\n");
   fprintf(stderr, "  --extension=<name>    Specify RoCC Extension\n");
   fprintf(stderr, "  --extlib=<name>       Shared library to load\n");
   fprintf(stderr, "  --rbb-port=<port>     Listen on <port> for remote bitbang connection\n");
+  fprintf(stderr, "  --trace               trace the cache activity\n");
   fprintf(stderr, "  --dump-dts            Print device tree string and exit\n");
   fprintf(stderr, "  --disable-dtb         Don't write the device tree blob into memory\n");
   fprintf(stderr, "  --dm-progsize=<words> Progsize for the debug module [default 2]\n");
@@ -99,15 +102,17 @@ int main(int argc, char** argv)
   bool halted = false;
   bool histogram = false;
   bool log = false;
+  bool trace = false;
   bool dump_dts = false;
   bool dtb_enabled = true;
   size_t nprocs = 1;
   reg_t start_pc = reg_t(-1);
   std::vector<std::pair<reg_t, mem_t*>> mems;
-  std::unique_ptr<icache_sim_t> ic;
-  std::unique_ptr<dcache_sim_t> dc;
-  std::unique_ptr<cache_sim_t> l2;
-  bool log_cache = false;
+  std::string cache_cfg_file("cache_model/config/cache.json");
+  std::string cache_cfg_model;
+  CacheCFG ccfg;
+  std::vector<CoherentCache *> l1_caches;
+  std::vector<CoherentCache *> l2_caches;
   std::function<extension_t*()> extension;
   const char* isa = DEFAULT_ISA;
   const char* varch = DEFAULT_VARCH;
@@ -150,13 +155,12 @@ int main(int argc, char** argv)
   parser.option(0, "rbb-port", 1, [&](const char* s){use_rbb = true; rbb_port = atoi(s);});
   parser.option(0, "pc", 1, [&](const char* s){start_pc = strtoull(s, 0, 0);});
   parser.option(0, "hartids", 1, hartids_parser);
-  parser.option(0, "ic", 1, [&](const char* s){ic.reset(new icache_sim_t(s));});
-  parser.option(0, "dc", 1, [&](const char* s){dc.reset(new dcache_sim_t(s));});
-  parser.option(0, "l2", 1, [&](const char* s){l2.reset(cache_sim_t::construct(s, "L2$"));});
-  parser.option(0, "log-cache-miss", 0, [&](const char* s){log_cache = true;});
+  parser.option(0, "cache-cfile", 1, [&](const char* s){cache_cfg_file = std::string(s);});
+  parser.option(0, "cache-model", 1, [&](const char* s){cache_cfg_model = std::string(s);});
   parser.option(0, "isa", 1, [&](const char* s){isa = s;});
   parser.option(0, "varch", 1, [&](const char* s){varch = s;});
   parser.option(0, "extension", 1, [&](const char* s){extension = find_extension(s);});
+  parser.option(0, "trace", 0, [&](const char *s){trace = true;});
   parser.option(0, "dump-dts", 0, [&](const char *s){dump_dts = true;});
   parser.option(0, "disable-dtb", 0, [&](const char *s){dtb_enabled = false;});
   parser.option(0, "extlib", 1, [&](const char *s){
@@ -207,19 +211,71 @@ int main(int argc, char** argv)
     return 0;
   }
 
-  if (ic && l2) ic->set_miss_handler(&*l2);
-  if (dc && l2) dc->set_miss_handler(&*l2);
-  if (ic) ic->set_log(log_cache);
-  if (dc) dc->set_log(log_cache);
+  // cache model
+  if(!cache_cfg_model.empty()) {
+    if(!cache_config_parser(cache_cfg_file, cache_cfg_model, &ccfg)) exit(1);
+    if(ccfg.enable[0] && ccfg.number[0] != nprocs * 2) {
+      fprintf(stderr, "The number of L1 caches %d do not match with the number of cores %ld\n", ccfg.number[0], nprocs);
+      exit(1);
+    }
+
+    if(ccfg.enable[0]) l1_caches.resize(ccfg.number[0]);
+    if(ccfg.enable[1]) l2_caches.resize(ccfg.number[1]);
+
+    if(ccfg.enable[0]) {
+      for(unsigned int i=0; i<ccfg.number[0]; i++)
+        l1_caches[i] = new L1CacheBase(i, i/2, i%2, ccfg.cache_gen[0],
+                                       ccfg.enable[1] ? &l2_caches : NULL,
+                                       ccfg.hash_gen[0]);
+    }
+
+    if(ccfg.enable[1]) {
+      for(unsigned int i=0; i<ccfg.number[1]; i++) {
+        l2_caches[i] = new LLCCacheBase(i, 2, ccfg.cache_gen[1], &l1_caches);
+      }
+    }
+
+    if(trace) {
+      for(unsigned int i=0; i<ccfg.number[0]; i++) {
+        reporter.register_cache_access_tracer(1, i/2, (int)i%2);
+      }
+      reporter.register_cache_access_tracer(2);
+    }
+
+    if(ccfg.enable[0])
+      for(size_t i = 0; i < nprocs; i++) {
+        s.get_core(i)->get_mmu()->register_cache_models(l1_caches[2*i], l1_caches[2*i+1]);
+      }
+  }
+
   for (size_t i = 0; i < nprocs; i++)
   {
-    if (ic) s.get_core(i)->get_mmu()->register_memtracer(&*ic);
-    if (dc) s.get_core(i)->get_mmu()->register_memtracer(&*dc);
     if (extension) s.get_core(i)->register_extension(extension());
   }
 
   s.set_debug(debug);
   s.set_log(log);
   s.set_histogram(histogram);
-  return s.run();
+  bool rv = s.run();
+
+  if(trace) {
+    fprintf(stdout, "------- statistics --------\n");
+    for(size_t i = 0; i < nprocs; i++) {
+      fprintf(stdout, "Core %ld runs %lu instructions\n", i, s.get_core(i)->get_state()->minstret);
+    }
+    for(unsigned int i=0; i<ccfg.number[0]; i++) {
+      uint64_t miss = reporter.check_cache_miss(1, i/2, i%2);
+      uint64_t evict = reporter.check_cache_evict(1, i/2, i%2);
+      uint64_t writeback = reporter.check_cache_writeback(1, i/2, i%2);
+      uint64_t access = reporter.check_cache_access(1, i/2, i%2);
+      fprintf(stdout, "%s: miss %lu, evict %lu, and writeback %lu in %lu access, miss rate %f\n", l1_caches[i]->cache_name().c_str(), miss, evict, writeback, access, (float)(miss)/access);
+    }
+    uint64_t miss = reporter.check_cache_miss(2);
+    uint64_t evict = reporter.check_cache_evict(2);
+    uint64_t writeback = reporter.check_cache_writeback(2);
+    uint64_t access = reporter.check_cache_access(2);
+    fprintf(stdout, "L2: miss %lu, evict %lu and writeback %lu in %lu access, miss rate %f\n", miss, evict, writeback, access, (float)(miss)/access);
+  }
+
+  return rv;
 }

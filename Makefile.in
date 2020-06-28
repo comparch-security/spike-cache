@@ -67,7 +67,7 @@ install_exes_dir := $(INSTALLDIR)/bin
 sprojs         := @subprojects@
 sprojs_enabled := @subprojects_enabled@
 
-sprojs_include := -I. -I$(src_dir) $(addprefix -I$(src_dir)/, $(sprojs_enabled))
+sprojs_include := -I. -I$(src_dir) $(addprefix -I$(src_dir)/, $(sprojs_enabled)) -I../cache_model
 VPATH := $(addprefix $(src_dir)/, $(sprojs_enabled))
 
 #-------------------------------------------------------------------------
@@ -94,7 +94,7 @@ COMPILE_C     := $(CC) -MMD -MP $(CPPFLAGS) $(CFLAGS) \
 comma := ,
 LD            := $(CXX)
 LDFLAGS       := @LDFLAGS@
-LIBS          := @LIBS@
+LIBS          := @LIBS@ -lcache_model -lrandomgen
 LINK          := $(LD) -L. $(LDFLAGS) -Wl,-rpath,$(install_libs_dir) $(patsubst -L%,-Wl$(comma)-rpath$(comma)%,$(filter -L%,$(LDFLAGS)))
 
 # Library creation
@@ -461,7 +461,7 @@ junk += $(project_name)-*.tar.gz
 # Default
 #-------------------------------------------------------------------------
 
-all : $(install_hdrs) $(install_libs) $(install_exes)
+all : librandomgen.a libcache_model.a $(install_hdrs) $(install_libs) $(install_exes)
 .PHONY : all
 
 #-------------------------------------------------------------------------
@@ -479,9 +479,23 @@ debug-% :
 #-------------------------------------------------------------------------
 
 clean :
-	rm -rf *~ \#* $(junk)
+	rm -rf *~ \#* $(junk) librandomgen.a libcache_model.a
 
 distclean :
 	rm -rf *~ \#* $(junk) $(dist_junk)
+	$(MAKE) -C ../cache_model/datagen clean
+	$(MAKE) -C ../cache_model clean
 
 .PHONY : clean distclean
+
+#-------------------------------------------------------------------------
+# Added for cache model
+#-------------------------------------------------------------------------
+
+libcache_model.a:
+	$(MAKE) -C ../cache_model libcache_model.a
+	cp ../cache_model/libcache_model.a ./
+
+librandomgen.a:
+	$(MAKE) -C ../cache_model/datagen librandomgen.a
+	cp ../cache_model/datagen/librandomgen.a ./
