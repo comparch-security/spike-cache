@@ -6,6 +6,7 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <stdexcept>
 
 class processor_t;
 

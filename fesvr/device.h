@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string>
 #include <functional>
+#include <stdexcept>
 
 class memif_t;
 
